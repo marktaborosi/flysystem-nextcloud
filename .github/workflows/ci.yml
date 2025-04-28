@@ -26,18 +26,21 @@ jobs:
           sudo apt-get update --allow-releaseinfo-change
           sudo apt-get install -y docker-compose
 
+      - name: 📄 Load environment variables
+        run: cp .env.example .env
 
       - name: 🚀 Start Docker containers
         run: |
           docker-compose up -d
-          sleep 60 # Wait for database and nextcloud to fully initialize
+          sleep 60
 
       - name: 📦 Install PHP dependencies
-        run: composer install --prefer-dist --no-progress --no-suggest
+        run: composer install --prefer-dist --no-progress
 
       - name: ✅ Run PHPUnit tests
         run: vendor/bin/phpunit
 
       - name: 🧹 Tear down containers
         if: always()
-        run: docker-compose down
+        run: |
+          docker-compose down
