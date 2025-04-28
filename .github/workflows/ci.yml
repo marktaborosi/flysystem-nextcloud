@@ -1,0 +1,43 @@
+name: 🧪 Continuous Integration (CI)
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    name: 🧹 Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐘 Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: none
+
+      - name: 🐳 Set up Docker Compose
+        run: |
+          sudo apt-get update --allow-releaseinfo-change
+          sudo apt-get install -y docker-compose
+
+
+      - name: 🚀 Start Docker containers
+        run: |
+          docker-compose up -d
+          sleep 60 # Wait for database and nextcloud to fully initialize
+
+      - name: 📦 Install PHP dependencies
+        run: composer install --prefer-dist --no-progress --no-suggest
+
+      - name: ✅ Run PHPUnit tests
+        run: vendor/bin/phpunit
+
+      - name: 🧹 Tear down containers
+        if: always()
+        run: docker-compose down
