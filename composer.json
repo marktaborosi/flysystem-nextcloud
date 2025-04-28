@@ -3,7 +3,6 @@
     "description": "A Flysystem v3 adapter for Nextcloud WebDav integration",
     "type": "library",
     "license": "MIT",
-    "version": "1.0.0",
     "autoload": {
         "psr-4": {
             "Marktaborosi\\FlysystemNextcloud\\": "src/",
