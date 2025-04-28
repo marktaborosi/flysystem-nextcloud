@@ -79,7 +79,29 @@ Configuration expects:
 
 - Admin user: `admin`
 - Admin password: `admin`
-- DB credentials: see `docker-compose.yml`
+- DB credentials: see `docker-compose.yml` or `.env`.
+
+> **Note:** You can override port mappings easily via the `.env` file.  
+> Example `.env` variables:
+> ```env
+> NEXTCLOUD_HTTP_PORT=8080
+> MARIADB_PORT=3306
+> ```
+
+### Accessing the Nextcloud Web Interface
+
+Once the Docker containers are up, you can access the Nextcloud web interface locally:
+
+```
+http://localhost:[NEXTCLOUD_HTTP_PORT]
+```
+
+Default credentials:
+
+- **Username:** `${NEXTCLOUD_ADMIN_USER}` (default: `admin`)
+- **Password:** `${NEXTCLOUD_ADMIN_PASSWORD}` (default: `admin`)
+
+You can login and interact directly with your running Nextcloud instance.
 
 ## Suggested Packages
 
@@ -100,4 +122,5 @@ Big thanks to:
 This adapter would not be possible without these open-source projects. 🙏
 
 ---
+
 > Made with ❤️ by [Mark Taborosi](https://github.com/marktaborosi)
