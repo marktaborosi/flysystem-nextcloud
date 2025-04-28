@@ -4,10 +4,7 @@ namespace Marktaborosi\FlysystemNextcloud\Tests\Integration;
 
 use League\Flysystem\AdapterTestUtilities\FilesystemAdapterTestCase;
 use League\Flysystem\Config;
-use League\Flysystem\Filesystem;
 use League\Flysystem\FilesystemException;
-use League\Flysystem\StorageAttributes;
-use League\Flysystem\UnableToRetrieveMetadata;
 use Marktaborosi\FlysystemNextcloud\NextCloudAdapter;
 use League\Flysystem\FilesystemAdapter;
 use Throwable;
