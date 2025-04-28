@@ -85,7 +85,15 @@ Configuration expects:
 > Example `.env` variables:
 > ```env
 > NEXTCLOUD_HTTP_PORT=8080
-> MARIADB_PORT=3306
+> NEXTCLOUD_DB_PORT=3306
+> 
+> MYSQL_ROOT_PASSWORD=root_password
+> MYSQL_DATABASE=nextcloud
+> MYSQL_USER=nextcloud
+> MYSQL_PASSWORD=nextcloud_password
+> 
+> NEXTCLOUD_ADMIN_USER=admin
+> NEXTCLOUD_ADMIN_PASSWORD=admin
 > ```
 
 ### Accessing the Nextcloud Web Interface
