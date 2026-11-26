@@ -28,7 +28,7 @@ jobs:
       - name: Validate composer.json
         run: composer validate --strict --no-check-lock
 
-      - uses: ramsey/composer-install@v3
+      - uses: ramsey/composer-install@v4
 
       - name: PHPStan
         run: composer analyse
@@ -52,7 +52,7 @@ jobs:
           php-version: ${{ matrix.php }}
           coverage: none
 
-      - uses: ramsey/composer-install@v3
+      - uses: ramsey/composer-install@v4
         with:
           dependency-versions: ${{ matrix.dependencies }}
 
@@ -87,7 +87,7 @@ jobs:
           php-version: '8.4'
           coverage: none
 
-      - uses: ramsey/composer-install@v3
+      - uses: ramsey/composer-install@v4
 
       - name: PHPUnit (integration)
         run: vendor/bin/phpunit --testsuite integration
