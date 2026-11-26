@@ -1,0 +1,17 @@
+# Normalize line endings
+* text=auto eol=lf
+*.bat text eol=crlf
+
+# Keep the Packagist dist archive small: ship only src/, composer.json, README, CHANGELOG and LICENSE.
+/.editorconfig          export-ignore
+/.env.example           export-ignore
+/.gitattributes         export-ignore
+/.github                export-ignore
+/.gitignore             export-ignore
+/.php-cs-fixer.dist.php export-ignore
+/CONTRIBUTING.md        export-ignore
+/docker-compose.yml     export-ignore
+/docker-compose.redis.yml export-ignore
+/phpstan.neon.dist      export-ignore
+/phpunit.xml.dist       export-ignore
+/tests                  export-ignore

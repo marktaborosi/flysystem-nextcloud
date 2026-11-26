@@ -1,36 +1,76 @@
 {
     "name": "marktaborosi/flysystem-nextcloud",
-    "description": "A Flysystem v3 adapter for Nextcloud WebDav integration",
+    "description": "Flysystem v3 adapter for Nextcloud (WebDAV)",
     "type": "library",
     "license": "MIT",
-    "autoload": {
-        "psr-4": {
-            "Marktaborosi\\FlysystemNextcloud\\": "src/",
-            "Marktaborosi\\FlysystemNextcloud\\Tests\\": "tests/"
-        }
+    "keywords": [
+        "flysystem",
+        "filesystem",
+        "storage",
+        "nextcloud",
+        "owncloud",
+        "webdav",
+        "dav",
+        "laravel",
+        "sabre"
+    ],
+    "homepage": "https://github.com/marktaborosi/flysystem-nextcloud",
+    "support": {
+        "issues": "https://github.com/marktaborosi/flysystem-nextcloud/issues",
+        "source": "https://github.com/marktaborosi/flysystem-nextcloud"
     },
     "authors": [
         {
             "name": "Mark Taborosi",
-            "email": "mark.taborosi@gmail.com"
+            "email": "mark.taborosi@gmail.com",
+            "homepage": "https://github.com/marktaborosi"
         }
     ],
     "require": {
+        "php": "^8.2",
+        "ext-curl": "*",
         "league/flysystem": "^3.29",
-        "sabre/dav": "^4.7",
-        "larapack/dd": "^1.1"
+        "sabre/dav": "^4.7"
     },
     "require-dev": {
-        "phpunit/phpunit": "^11.5",
+        "friendsofphp/php-cs-fixer": "^3.64",
         "league/flysystem-adapter-test-utilities": "^3.29",
-        "phpstan/phpstan": "^2.1"
+        "phpstan/phpstan": "^2.1",
+        "phpunit/phpunit": "^11.5"
+    },
+    "autoload": {
+        "psr-4": {
+            "Marktaborosi\\FlysystemNextcloud\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Marktaborosi\\FlysystemNextcloud\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "sort-packages": true
     },
     "scripts": {
         "test": "phpunit",
-        "analyse": "phpstan analyse src tests"
+        "test:unit": "phpunit --testsuite unit",
+        "test:integration": "phpunit --testsuite integration",
+        "analyse": "phpstan analyse --memory-limit=512M",
+        "cs": "php-cs-fixer fix --dry-run --diff",
+        "cs:fix": "php-cs-fixer fix",
+        "ci": [
+            "@analyse",
+            "@test:unit"
+        ]
     },
-    "suggest": {
-        "sabre/dav": "Required for WebDAV communication with Nextcloud.",
-        "larapack/dd": "Optional debugging helper, useful for development."
-    }
+    "scripts-descriptions": {
+        "test": "Run all tests (integration tests need a running Nextcloud, see README)",
+        "test:unit": "Run the fast unit tests (no server needed)",
+        "test:integration": "Run the integration tests against Nextcloud",
+        "analyse": "Run PHPStan",
+        "cs": "Check coding style",
+        "cs:fix": "Fix coding style"
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
 }

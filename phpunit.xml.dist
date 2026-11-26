@@ -1,21 +1,37 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<phpunit bootstrap="vendor/autoload.php"
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor/autoload.php"
+         cacheDirectory=".phpunit.cache"
          colors="true"
-         verbose="true"
-         stopOnFailure="false"
-         failOnWarning="true"
-         failOnRisky="true"
          testdox="true"
->
+         executionOrder="depends,defects"
+         beStrictAboutOutputDuringTests="true"
+         failOnRisky="true"
+         failOnWarning="true">
     <testsuites>
-        <testsuite name="Nextcloud Adapter Test Suite">
-            <directory>./tests</directory>
+        <testsuite name="unit">
+            <directory>tests/Unit</directory>
+        </testsuite>
+        <testsuite name="integration">
+            <directory>tests/Integration</directory>
         </testsuite>
     </testsuites>
 
-    <coverage>
+    <source>
         <include>
-            <directory suffix=".php">src</directory>
+            <directory>src</directory>
         </include>
-    </coverage>
+    </source>
+
+    <php>
+        <!-- The scenario tests upload and download files of 25 MiB. -->
+        <ini name="memory_limit" value="1G"/>
+        <!-- Defaults match docker-compose.yml. Real environment variables take precedence. -->
+        <env name="NEXTCLOUD_BASE_URI" value="http://localhost:8080/remote.php/dav/files/admin/"/>
+        <env name="NEXTCLOUD_USERNAME" value="admin"/>
+        <env name="NEXTCLOUD_PASSWORD" value="admin"/>
+        <!-- Set to 1 (CI does) to fail instead of skipping when Nextcloud is unreachable. -->
+        <env name="NEXTCLOUD_INTEGRATION_REQUIRED" value="0"/>
+    </php>
 </phpunit>

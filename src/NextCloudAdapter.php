@@ -1,726 +1,1144 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Marktaborosi\FlysystemNextcloud;
 
+use InvalidArgumentException;
+use League\Flysystem\CalculateChecksumFromStream;
+use League\Flysystem\ChecksumProvider;
 use League\Flysystem\Config;
 use League\Flysystem\DirectoryAttributes;
 use League\Flysystem\FileAttributes;
 use League\Flysystem\FilesystemAdapter;
-use League\Flysystem\FilesystemException;
+use League\Flysystem\FilesystemOperationFailed;
 use League\Flysystem\StorageAttributes;
+use League\Flysystem\UnableToCheckDirectoryExistence;
+use League\Flysystem\UnableToCheckFileExistence;
 use League\Flysystem\UnableToCopyFile;
 use League\Flysystem\UnableToCreateDirectory;
 use League\Flysystem\UnableToDeleteDirectory;
 use League\Flysystem\UnableToDeleteFile;
+use League\Flysystem\UnableToGeneratePublicUrl;
 use League\Flysystem\UnableToListContents;
 use League\Flysystem\UnableToMoveFile;
+use League\Flysystem\UnableToProvideChecksum;
 use League\Flysystem\UnableToReadFile;
 use League\Flysystem\UnableToRetrieveMetadata;
 use League\Flysystem\UnableToSetVisibility;
+use League\Flysystem\UnableToWriteFile;
+use League\Flysystem\UrlGeneration\PublicUrlGenerator;
 use League\Flysystem\Visibility;
+use Marktaborosi\FlysystemNextcloud\Internal\ServerLayout;
+use Marktaborosi\FlysystemNextcloud\Internal\ShareApi;
+use RuntimeException;
 use Sabre\DAV\Client;
 use Sabre\DAV\Xml\Property\ResourceType;
 use Sabre\HTTP\ClientHttpException;
-use InvalidArgumentException;
-use RuntimeException;
 use Throwable;
 
 /**
- * Flysystem v3 adapter for Nextcloud via WebDAV.
+ * Flysystem v3 adapter for Nextcloud.
  *
- * This adapter allows you to interact with a Nextcloud server using the WebDAV protocol,
- * enabling you to store, retrieve, delete, and manipulate files and directories
- * through the League/Flysystem filesystem abstraction layer.
+ * Files are handled over WebDAV (PROPFIND, GET, PUT, DELETE, MKCOL, MOVE, COPY),
+ * public links over the OCS sharing API. On top of plain WebDAV it supports:
  *
- * Supported operations:
- * - Listing contents (files, directories)
- * - Reading and writing files
- * - Deleting files and directories
- * - Creating directories
- * - Copying and moving files
- * - Retrieving file metadata (size, last modified, MIME type)
+ * - chunked uploads for large files (Nextcloud's upload API),
+ * - checksums (MD5 and SHA1 are stored with every upload),
+ * - public URLs (read-only public link shares),
+ * - optionally, visibility backed by public link shares ({@see VisibilityMode::PublicLinks}),
+ * - optionally, deep listings with a single SEARCH request.
  *
- * Unsupported features:
- * - Setting and retrieving visibility (public/private) - not supported via WebDAV natively
- *
- * @package Marktaborosi\FlysystemNextcloud
- * @author Marktaborosi
- * @license MIT
+ * HTTP errors are always reported as the matching Flysystem exception; the underlying
+ * {@see UnexpectedStatusCode} (or transport error) is attached as "previous".
  */
-class NextCloudAdapter implements FilesystemAdapter
+class NextCloudAdapter implements FilesystemAdapter, PublicUrlGenerator, ChecksumProvider
 {
-    private Client $client;
-    private string $baseUri;
+    use CalculateChecksumFromStream;
+
+    /** Files larger than this are uploaded in chunks by default (10 MiB). */
+    public const DEFAULT_CHUNK_SIZE = 10 * 1024 * 1024;
+
+    private const PROP_RESOURCE_TYPE = '{DAV:}resourcetype';
+    private const PROP_CONTENT_LENGTH = '{DAV:}getcontentlength';
+    private const PROP_CONTENT_TYPE = '{DAV:}getcontenttype';
+    private const PROP_LAST_MODIFIED = '{DAV:}getlastmodified';
+    private const PROP_CHECKSUMS = '{http://owncloud.org/ns}checksums';
+
+    private const LISTING_PROPERTIES = [
+        self::PROP_RESOURCE_TYPE,
+        self::PROP_CONTENT_LENGTH,
+        self::PROP_CONTENT_TYPE,
+        self::PROP_LAST_MODIFIED,
+    ];
+
+    private const UNKNOWN_MIME_TYPE = 'application/octet-stream';
+
+    /** Nextcloud accepts chunk numbers 1 to 10000. */
+    private const MAX_CHUNKS = 10000;
+
+    /** A SEARCH answer with this many results may be truncated, so we fall back to PROPFIND. */
+    private const SEARCH_LIMIT = 10000;
+
+    private const READ_BUFFER = 1024 * 1024;
+
+    private readonly Client $client;
+
+    /** Decoded URL path of the base URI, always with a trailing slash (e.g. "/remote.php/dav/files/admin/"). */
+    private readonly string $basePath;
+
+    private readonly ?ServerLayout $layout;
+
+    private ?ShareApi $shareApi = null;
+
+    /** @var array<string, string> In-memory visibility per normalized path ({@see VisibilityMode::InMemory}). */
     private array $visibilities = [];
 
-    public function __construct(array $settings)
-    {
-        $this->client = new Client($settings);
-        $this->baseUri = rtrim(parse_url($settings['baseUri'], PHP_URL_PATH), '/') . '/';
+    /**
+     * @param Client|array{baseUri: string, userName?: string, password?: string, authType?: int, proxy?: string, encoding?: int} $client
+     *        Either a configured Sabre DAV client, or the settings array passed to {@see Client::__construct()}.
+     *        The base URI should point at the user's files root (or a folder in it), e.g.
+     *        "https://cloud.example.com/remote.php/dav/files/{userId}/".
+     * @param VisibilityMode $visibilityMode How public/private visibility is handled.
+     * @param int|null $chunkSize Files larger than this many bytes are uploaded in chunks of this size.
+     *        null disables chunked uploads. Keep it at 5 MiB or more if Nextcloud uses S3 as primary storage.
+     * @param bool $searchDeepListing Use a single SEARCH request for deep listings (much faster for big trees).
+     *        SEARCH reads Nextcloud's file index, which can lag behind external storages that are changed
+     *        outside of Nextcloud. Falls back to PROPFIND automatically when SEARCH is unavailable.
+     */
+    public function __construct(
+        Client|array $client,
+        private readonly VisibilityMode $visibilityMode = VisibilityMode::InMemory,
+        private readonly ?int $chunkSize = self::DEFAULT_CHUNK_SIZE,
+        private readonly bool $searchDeepListing = false,
+    ) {
+        if ($chunkSize !== null && $chunkSize < 1) {
+            throw new InvalidArgumentException('The chunk size must be a positive number of bytes, or null to disable chunked uploads.');
+        }
+
+        if (is_array($client)) {
+            $client = new Client(self::normalizeSettings($client));
+        }
+
+        $this->client = $client;
+
+        $baseUri = $this->client->getAbsoluteUrl('');
+        $basePath = parse_url($baseUri, PHP_URL_PATH);
+        $this->basePath = rtrim(rawurldecode(is_string($basePath) ? $basePath : ''), '/') . '/';
+        $this->layout = ServerLayout::fromBaseUri($baseUri);
     }
 
     /**
-     * Determine whether a file exists at the given path.
+     * Convenience constructor: builds the WebDAV URL from the server URL and the user.
      *
-     * @param string $path The file path.
+     *     NextCloudAdapter::fromCredentials('https://cloud.example.com', 'alice', 'app-password', folder: 'Projects')
      *
-     * @return bool True if the file exists and is not a directory, false otherwise.
-     *
-     * @throws Throwable If the underlying client throws an unexpected exception.
+     * @param string $serverUrl The Nextcloud URL as you open it in the browser (including a sub-path, if any).
+     * @param string $folder Optional folder inside the user's files; all paths become relative to it.
+     * @param string|null $userId The user id, when it differs from the login name (LDAP, e-mail logins, ...).
      */
+    public static function fromCredentials(
+        string $serverUrl,
+        string $username,
+        string $password,
+        string $folder = '',
+        ?string $userId = null,
+        VisibilityMode $visibilityMode = VisibilityMode::InMemory,
+        ?int $chunkSize = self::DEFAULT_CHUNK_SIZE,
+        bool $searchDeepListing = false,
+    ): self {
+        $segments = array_filter(explode('/', trim($folder, '/')), static fn (string $s): bool => $s !== '');
+        $baseUri = rtrim($serverUrl, '/') . '/remote.php/dav/files/' . rawurlencode($userId ?? $username) . '/'
+            . implode('/', array_map(rawurlencode(...), $segments));
+
+        return new self(
+            ['baseUri' => $baseUri, 'userName' => $username, 'password' => $password],
+            $visibilityMode,
+            $chunkSize,
+            $searchDeepListing,
+        );
+    }
+
     public function fileExists(string $path): bool
     {
-        $encodedPath = $this->encodePath($path);
-
         try {
-            $response = $this->client->propFind($encodedPath, ['{DAV:}resourcetype']);
-
-            // If no response, the file does not exist.
-            if (empty($response)) {
-                return false;
-            }
-
-            // Check if the path refers to a directory (collection).
-            if (
-                isset($response['{DAV:}resourcetype']) &&
-                $response['{DAV:}resourcetype'] instanceof ResourceType &&
-                in_array('{DAV:}collection', $response['{DAV:}resourcetype']->getValue(), true)
-            ) {
-                return false;
-            }
-
-            return true;
-        } catch (Throwable) {
-            // If any error occurs (e.g., 404 Not Found), treat as "file does not exist".
-            return false;
+            $properties = $this->propFind($path, [self::PROP_RESOURCE_TYPE]);
+        } catch (Throwable $exception) {
+            throw UnableToCheckFileExistence::forLocation($path, $exception);
         }
+
+        return $properties !== null && !self::isDirectory($properties);
     }
 
-    /**
-     * Determine whether a directory exists at the given path.
-     *
-     * @param string $path The directory path.
-     *
-     * @return bool True if the directory exists, false otherwise.
-     *
-     * @throws Throwable If the underlying client throws an unexpected exception.
-     */
     public function directoryExists(string $path): bool
     {
-        $encodedPath = $this->encodePath($path);
-
         try {
-            $response = $this->client->propFind($encodedPath, ['{DAV:}resourcetype']);
-
-            // If no resource type is available, the directory does not exist.
-            if (!isset($response['{DAV:}resourcetype'])) {
-                return false;
-            }
-
-            $resourceType = $response['{DAV:}resourcetype'];
-
-            // Check if the resource type indicates a collection (directory).
-            return $resourceType instanceof ResourceType &&
-                in_array('{DAV:}collection', $resourceType->getValue(), true);
-        } catch (Throwable) {
-            // If any error occurs (e.g., 404 Not Found), treat as "directory does not exist".
-            return false;
+            $properties = $this->propFind($path, [self::PROP_RESOURCE_TYPE]);
+        } catch (Throwable $exception) {
+            throw UnableToCheckDirectoryExistence::forLocation($path, $exception);
         }
+
+        return $properties !== null && self::isDirectory($properties);
     }
 
-    /**
-     * Write a new file at the given path with the provided contents.
-     *
-     * @param string $path The path where the file should be written.
-     * @param string $contents The file contents to write.
-     * @param Config $config Configuration object, potentially containing visibility settings.
-     *
-     * @throws Throwable If an error occurs during the file upload.
-     */
     public function write(string $path, string $contents, Config $config): void
     {
-        // Ensure the parent directory exists before writing the file.
-        $this->ensureParentDirectoryExists($path);
-
-        // Prepare and encode the path for WebDAV communication.
-        $encodedPath = $this->encodePath($path);
-
-        // Store file visibility settings if applicable.
-        $this->storeVisibility($config, $path);
-
-        // Upload the file using WebDAV PUT request.
-        $this->client->request('PUT', $encodedPath, $contents);
+        $this->upload($path, $contents, $config);
     }
 
     /**
-     * Write a new file at the given path using a stream resource.
-     *
-     * @param string $path The path where the file should be written.
-     * @param resource $contents A readable stream resource containing the file data.
-     * @param Config $config Configuration object, potentially containing visibility settings.
-     *
-     * @throws InvalidArgumentException If the provided contents are not a valid stream resource.
-     * @throws RuntimeException If reading from the stream fails.
-     * @throws Throwable If an error occurs during the file upload.
+     * @param resource $contents
      */
     public function writeStream(string $path, $contents, Config $config): void
     {
         if (!is_resource($contents)) {
-            throw new InvalidArgumentException('The contents must be a valid stream resource.');
+            throw UnableToWriteFile::atLocation($path, 'The contents must be a valid stream resource.');
         }
 
-        $data = stream_get_contents($contents);
-        if ($data === false) {
-            throw new RuntimeException('Failed to read from the provided stream.');
-        }
-
-        // Store file visibility settings if applicable.
-        $this->storeVisibility($config, $path);
-
-        // Delegate writing to the standard write method.
-        $this->write($path, $data, $config);
+        $this->upload($path, $contents, $config);
     }
 
-
-    /**
-     * Read the contents of a file at the given path.
-     *
-     * @param string $path The path to the file.
-     *
-     * @return string The file contents.
-     *
-     * @throws UnableToReadFile If the file does not exist or cannot be read.
-     */
     public function read(string $path): string
     {
-        $encodedPath = $this->encodePath($path);
-
         try {
-            $response = $this->client->request('GET', $encodedPath);
-        } catch (Throwable $e) {
-            throw UnableToReadFile::fromLocation($path, $e->getMessage(), $e);
+            $response = $this->request('GET', $path);
+        } catch (Throwable $exception) {
+            throw UnableToReadFile::fromLocation($path, $exception->getMessage(), $exception);
         }
 
-        // Validate the response format and ensure a body is present.
-        if (empty($response) || !is_array($response) || !isset($response['body'])) {
-            throw UnableToReadFile::fromLocation($path, 'No valid response body received.');
+        if ($response['statusCode'] !== 200) {
+            $exception = UnexpectedStatusCode::fromResponse('GET', $response);
+
+            throw UnableToReadFile::fromLocation(
+                $path,
+                $response['statusCode'] === 404 ? 'File does not exist.' : $exception->getMessage(),
+                $exception,
+            );
         }
 
-        // Check if the response explicitly indicates a missing file.
-        if (isset($response['statusCode']) && (int)$response['statusCode'] === 404) {
-            throw UnableToReadFile::fromLocation($path, 'File does not exist.');
-        }
-
-        return (string) $response['body'];
+        return $response['body'];
     }
 
-
     /**
-     * Read the contents of a file at the given path as a stream.
-     *
-     * @param string $path The path to the file.
-     *
-     * @return resource A readable stream resource containing the file contents.
-     *
-     * @throws UnableToReadFile If the file cannot be read or streamed.
+     * @return resource
      */
     public function readStream(string $path)
     {
-        try {
-            $contents = $this->read($path);
-        } catch (UnableToReadFile $e) {
-            throw $e;
-        } catch (Throwable $e) {
-            throw UnableToReadFile::fromLocation($path, $e->getMessage(), $e);
-        }
+        $contents = $this->read($path);
 
-        // Create an in-memory stream to hold the file contents.
-        $stream = fopen('php://memory', 'r+');
-        if ($stream === false) {
-            throw UnableToReadFile::fromLocation($path, 'Unable to open memory stream.');
-        }
+        // php://temp keeps small files in memory and spills large ones to disk.
+        $stream = fopen('php://temp', 'w+b');
 
-        // Write the contents into the stream.
-        if (fwrite($stream, $contents) === false) {
-            throw UnableToReadFile::fromLocation($path, 'Unable to write contents to memory stream.');
-        }
-
-        // Rewind the stream to the beginning for reading.
-        if (rewind($stream) === false) {
-            throw UnableToReadFile::fromLocation($path, 'Unable to rewind memory stream.');
+        if ($stream === false || fwrite($stream, $contents) === false || !rewind($stream)) {
+            throw UnableToReadFile::fromLocation($path, 'Unable to create a stream for the file contents.');
         }
 
         return $stream;
     }
 
-
-    /**
-     * Delete a file at the given path.
-     *
-     * @param string $path The path to the file to delete.
-     *
-     * @throws UnableToDeleteFile If the file cannot be deleted.
-     */
     public function delete(string $path): void
     {
-        $encodedPath = $this->encodePath($path);
-
         try {
-            $this->client->request('DELETE', $encodedPath);
-        } catch (Throwable $e) {
-            throw UnableToDeleteFile::atLocation($path, $e->getMessage(), $e);
+            $response = $this->request('DELETE', $path);
+        } catch (Throwable $exception) {
+            throw UnableToDeleteFile::atLocation($path, $exception->getMessage(), $exception);
         }
+
+        // Deleting a file that does not exist is not an error in Flysystem.
+        if (!self::isSuccessful($response['statusCode']) && $response['statusCode'] !== 404) {
+            $exception = UnexpectedStatusCode::fromResponse('DELETE', $response);
+
+            throw UnableToDeleteFile::atLocation($path, $exception->getMessage(), $exception);
+        }
+
+        unset($this->visibilities[self::normalize($path)]);
     }
 
-    /**
-     * Delete a directory at the given path.
-     *
-     * @param string $path The path to the directory to delete.
-     *
-     * @throws UnableToDeleteDirectory If the directory cannot be deleted.
-     */
     public function deleteDirectory(string $path): void
     {
+        $normalized = self::normalize($path);
+
+        // Never wipe the user's whole Nextcloud storage by accident.
+        if ($normalized === '') {
+            throw UnableToDeleteDirectory::atLocation($path, 'Refusing to delete the root directory.');
+        }
+
         try {
-            $this->delete($path);
-        } catch (UnableToDeleteFile $e) {
-            // Re-throw as a directory-specific exception.
-            throw UnableToDeleteDirectory::atLocation($path, $e->getMessage(), $e);
-        } catch (Throwable $e) {
-            throw UnableToDeleteDirectory::atLocation($path, $e->getMessage(), $e);
+            $response = $this->request('DELETE', $normalized . '/');
+        } catch (Throwable $exception) {
+            throw UnableToDeleteDirectory::atLocation($path, $exception->getMessage(), $exception);
+        }
+
+        if (!self::isSuccessful($response['statusCode']) && $response['statusCode'] !== 404) {
+            $exception = UnexpectedStatusCode::fromResponse('DELETE', $response);
+
+            throw UnableToDeleteDirectory::atLocation($path, $exception->getMessage(), $exception);
+        }
+
+        foreach (array_keys($this->visibilities) as $key) {
+            if (str_starts_with($key, $normalized . '/')) {
+                unset($this->visibilities[$key]);
+            }
         }
     }
 
-    /**
-     * Create a directory at the given path.
-     *
-     * @param string $path The path where the directory should be created.
-     * @param Config $config Configuration object, potentially containing visibility settings.
-     *
-     * @throws UnableToCreateDirectory If the directory cannot be created.
-     * @throws Throwable If a non-standard error occurs.
-     */
     public function createDirectory(string $path, Config $config): void
     {
-        // Ensure that the parent directory exists before creating the new one.
-        $this->ensureParentDirectoryExists($path);
+        $normalized = self::normalize($path);
 
-        // Encode the path for WebDAV communication.
-        $encodedPath = $this->encodePath($path);
+        if ($normalized === '') {
+            return;
+        }
 
         try {
-            // Issue a MKCOL request to create the directory.
-            $this->client->request('MKCOL', $encodedPath);
-        } catch (Throwable $e) {
-            throw UnableToCreateDirectory::dueToFailure($e->getMessage(), $e);
+            $this->ensureParentDirectoryExists($normalized);
+            $response = $this->request('MKCOL', $normalized . '/');
+
+            if (self::isSuccessful($response['statusCode'])) {
+                return;
+            }
+
+            // 405 Method Not Allowed: something already exists at this location.
+            // That is fine (createDirectory is idempotent) as long as it is a directory.
+            if ($response['statusCode'] === 405 && $this->directoryExists($normalized)) {
+                return;
+            }
+        } catch (Throwable $exception) {
+            throw UnableToCreateDirectory::atLocation($path, $exception->getMessage(), $exception);
         }
+
+        $exception = UnexpectedStatusCode::fromResponse('MKCOL', $response);
+
+        throw UnableToCreateDirectory::atLocation($path, $exception->getMessage(), $exception);
     }
 
-
-    /**
-     * Set the visibility for a file at the given path.
-     *
-     * Note: Nextcloud WebDAV does not support visibility natively.
-     * Visibility is simulated and cached internally within the adapter.
-     *
-     * @param string $path The path to the file.
-     * @param string $visibility Either 'public' or 'private'.
-     *
-     * @throws UnableToSetVisibility If the file does not exist or visibility cannot be set.
-     * @throws Throwable If another unexpected error occurs.
-     */
     public function setVisibility(string $path, string $visibility): void
     {
-        $path = ltrim($path, '/');
-
-        try {
-            if (!$this->fileExists($path)) {
-                throw UnableToSetVisibility::atLocation($path, 'File does not exist.');
-            }
-        } catch (ClientHttpException $e) {
-            if ($e->getHttpStatus() === 404) {
-                throw UnableToSetVisibility::atLocation($path, 'File does not exist.');
-            }
-            throw $e;
+        if (!in_array($visibility, [Visibility::PUBLIC, Visibility::PRIVATE], true)) {
+            throw UnableToSetVisibility::atLocation($path, sprintf('Unknown visibility "%s".', $visibility));
         }
 
-        // Simulate visibility by caching it internally.
-        $this->visibilities[$path] = $visibility;
+        if ($this->visibilityMode === VisibilityMode::PublicLinks) {
+            $this->setVisibilityWithShares($path, $visibility);
+
+            return;
+        }
+
+        try {
+            $exists = $this->fileExists($path);
+        } catch (FilesystemOperationFailed $exception) {
+            throw UnableToSetVisibility::atLocation($path, $exception->getMessage(), $exception);
+        }
+
+        if (!$exists) {
+            throw UnableToSetVisibility::atLocation($path, 'File does not exist.');
+        }
+
+        $this->visibilities[self::normalize($path)] = $visibility;
     }
 
-    /**
-     * Retrieve the visibility setting for a file at the given path.
-     *
-     * Note: Nextcloud WebDAV does not natively support visibility settings.
-     * Visibility is simulated and cached internally within the adapter.
-     *
-     * @param string $path The path to the file.
-     *
-     * @return FileAttributes The file attributes including the visibility metadata.
-     *
-     * @throws UnableToRetrieveMetadata|ClientHttpException If the file does not exist or the metadata cannot be retrieved.
-     */
     public function visibility(string $path): FileAttributes
     {
-        $path = ltrim($path, '/');
+        $normalized = self::normalize($path);
 
-        try {
-            if (!$this->fileExists($path)) {
+        if ($this->visibilityMode === VisibilityMode::PublicLinks) {
+            try {
+                $shares = $this->shareApi()->linkShares($normalized);
+            } catch (Throwable $exception) {
+                throw UnableToRetrieveMetadata::visibility($path, $exception->getMessage(), $exception);
+            }
+
+            if ($shares === null) {
                 throw UnableToRetrieveMetadata::visibility($path, 'File does not exist.');
             }
-        } catch (ClientHttpException $e) {
-            if ($e->getHttpStatus() === 404) {
-                throw UnableToRetrieveMetadata::visibility($path, $e->getMessage(), $e);
-            }
-            throw $e;
-        } catch (FilesystemException|Throwable $e) {
-            throw UnableToRetrieveMetadata::visibility($path, $e->getMessage(), $e);
+
+            return new FileAttributes($normalized, visibility: $shares === [] ? Visibility::PRIVATE : Visibility::PUBLIC);
         }
-
-        // Default to 'private' if visibility has not been explicitly set.
-        $visibility = $this->visibilities[$path] ?? Visibility::PRIVATE;
-
-        return new FileAttributes($path, null, $visibility, null);
-    }
-
-
-    /**
-     * Retrieve the MIME type for a file at the given path.
-     *
-     * @param string $path The path to the file.
-     *
-     * @return FileAttributes The file attributes including MIME type metadata.
-     *
-     * @throws UnableToRetrieveMetadata If the file is a directory or the MIME type cannot be determined.
-     */
-    public function mimeType(string $path): FileAttributes
-    {
-        $encodedPath = $this->encodePath($path);
 
         try {
-            $response = $this->client->propFind($encodedPath, ['{DAV:}getcontenttype', '{DAV:}resourcetype']);
-        } catch (Throwable $e) {
-            throw UnableToRetrieveMetadata::mimeType($path, $e->getMessage(), $e);
+            $exists = $this->fileExists($path);
+        } catch (FilesystemOperationFailed $exception) {
+            throw UnableToRetrieveMetadata::visibility($path, $exception->getMessage(), $exception);
         }
 
-        // If the path is a directory, retrieving MIME type is not valid.
-        if (isset($response['{DAV:}resourcetype']) &&
-            $response['{DAV:}resourcetype'] instanceof ResourceType &&
-            in_array('{DAV:}collection', $response['{DAV:}resourcetype']->getValue(), true)
-        ) {
-            throw UnableToRetrieveMetadata::mimeType($path, 'Path is a directory.');
+        if (!$exists) {
+            throw UnableToRetrieveMetadata::visibility($path, 'File does not exist.');
         }
 
-        // Fetch and validate the MIME type.
-        $contentType = $response['{DAV:}getcontenttype'] ?? '';
+        return new FileAttributes($normalized, visibility: $this->visibilities[$normalized] ?? Visibility::PRIVATE);
+    }
 
-        if ($contentType === 'application/octet-stream' || trim((string)$contentType) === '') {
+    public function mimeType(string $path): FileAttributes
+    {
+        $properties = $this->fileProperties($path, [self::PROP_CONTENT_TYPE], UnableToRetrieveMetadata::mimeType(...));
+        $mimeType = self::mimeTypeFrom($properties);
+
+        if ($mimeType === null) {
             throw UnableToRetrieveMetadata::mimeType($path, 'Missing or unknown content type.');
         }
 
-        return new FileAttributes($path, null, null, null, trim((string) $contentType));
+        return new FileAttributes(self::normalize($path), mimeType: $mimeType);
     }
 
-
-
-    /**
-     * Retrieve the last modified timestamp for a file at the given path.
-     *
-     * @param string $path The path to the file.
-     *
-     * @return FileAttributes The file attributes including the last modified timestamp.
-     *
-     * @throws UnableToRetrieveMetadata If the last modified metadata cannot be determined.
-     */
     public function lastModified(string $path): FileAttributes
     {
-        $encodedPath = $this->encodePath($path);
+        $properties = $this->fileProperties($path, [self::PROP_LAST_MODIFIED], UnableToRetrieveMetadata::lastModified(...));
+        $lastModified = self::lastModifiedFrom($properties);
 
-        try {
-            $response = $this->client->propFind($encodedPath, ['{DAV:}getlastmodified']);
-
-            if (!isset($response['{DAV:}getlastmodified'])) {
-                throw UnableToRetrieveMetadata::lastModified($path, 'Last modified property missing.');
-            }
-
-            $timestamp = strtotime($response['{DAV:}getlastmodified']);
-
-            if ($timestamp === false) {
-                throw UnableToRetrieveMetadata::lastModified($path, 'Invalid last modified date format.');
-            }
-
-            return new FileAttributes($path, null, null, $timestamp);
-        } catch (Throwable $e) {
-            throw UnableToRetrieveMetadata::lastModified($path, $e->getMessage(), $e);
+        if ($lastModified === null) {
+            throw UnableToRetrieveMetadata::lastModified($path, 'Missing or invalid last modified date.');
         }
+
+        return new FileAttributes(self::normalize($path), lastModified: $lastModified);
     }
 
-
-    /**
-     * Retrieve the file size for a file at the given path.
-     *
-     * @param string $path The path to the file.
-     *
-     * @return FileAttributes The file attributes including the file size.
-     *
-     * @throws UnableToRetrieveMetadata If the path is a directory or the file size cannot be determined.
-     */
     public function fileSize(string $path): FileAttributes
     {
-        $encodedPath = $this->encodePath($path);
+        $properties = $this->fileProperties($path, [self::PROP_CONTENT_LENGTH], UnableToRetrieveMetadata::fileSize(...));
+        $fileSize = self::fileSizeFrom($properties);
 
-        try {
-            $response = $this->client->propFind($encodedPath, ['{DAV:}resourcetype', '{DAV:}getcontentlength']);
-        } catch (Throwable $e) {
-            throw UnableToRetrieveMetadata::fileSize($path, $e->getMessage(), $e);
-        }
-
-        // If the path is a directory, we cannot retrieve a file size.
-        if (isset($response['{DAV:}resourcetype']) &&
-            $response['{DAV:}resourcetype'] instanceof ResourceType &&
-            in_array('{DAV:}collection', $response['{DAV:}resourcetype']->getValue(), true)
-        ) {
-            throw UnableToRetrieveMetadata::fileSize($path, 'Path is a directory.');
-        }
-
-        // Validate the content length presence.
-        if (!isset($response['{DAV:}getcontentlength'])) {
+        if ($fileSize === null) {
             throw UnableToRetrieveMetadata::fileSize($path, 'Missing content length.');
         }
 
-        return new FileAttributes($path, (int) $response['{DAV:}getcontentlength']);
+        return new FileAttributes(self::normalize($path), $fileSize);
     }
 
+    /**
+     * Returns the checksum Nextcloud stored with the file (MD5 and SHA1 are sent with every upload
+     * made by this adapter). For other algorithms, or files uploaded by other clients, the file is
+     * downloaded and hashed. Use the "checksum_algo" config option to pick the algorithm (default md5).
+     */
+    public function checksum(string $path, Config $config): string
+    {
+        $algorithm = $config->get('checksum_algo', 'md5');
+        $algorithm = strtolower(is_string($algorithm) ? $algorithm : 'md5');
+
+        try {
+            $properties = $this->propFind($path, [self::PROP_CHECKSUMS, self::PROP_RESOURCE_TYPE]);
+        } catch (Throwable $exception) {
+            throw new UnableToProvideChecksum($exception->getMessage(), $path, $exception);
+        }
+
+        if ($properties === null) {
+            throw new UnableToProvideChecksum('File does not exist.', $path);
+        }
+
+        if (self::isDirectory($properties)) {
+            throw new UnableToProvideChecksum('Path is a directory.', $path);
+        }
+
+        $stored = self::checksumsFrom($properties);
+
+        return $stored[$algorithm] ?? $this->calculateChecksumFromStream($path, $config);
+    }
 
     /**
-     * List the contents of a directory.
+     * Returns a direct download URL backed by a read-only public link share.
      *
-     * @param string $path The path to the directory.
-     * @param bool $deep Whether to list recursively (deep traversal).
-     *
-     * @return iterable<StorageAttributes> A list of storage attributes for files and directories.
-     *
-     * @throws FilesystemException If listing contents fails.
+     * An existing public link of the file (without password and not expired) is reused,
+     * otherwise one is created. Note that this makes the file publicly accessible.
+     */
+    public function publicUrl(string $path, Config $config): string
+    {
+        try {
+            $api = $this->shareApi();
+            $shares = $api->linkShares($path);
+
+            if ($shares === null) {
+                throw new UnableToGeneratePublicUrl('File does not exist.', $path);
+            }
+
+            $url = null;
+
+            foreach ($shares as $share) {
+                $expired = $share['expiration'] !== null && ($time = strtotime($share['expiration'])) !== false && $time <= time();
+
+                if (!$share['hasPassword'] && !$expired && $share['url'] !== '') {
+                    $url = $share['url'];
+                    break;
+                }
+            }
+
+            $url ??= $api->createLinkShare($path);
+        } catch (UnableToGeneratePublicUrl $exception) {
+            throw $exception;
+        } catch (Throwable $exception) {
+            throw UnableToGeneratePublicUrl::dueToError($path, $exception);
+        }
+
+        return rtrim($url, '/') . '/download';
+    }
+
+    /**
+     * @return iterable<StorageAttributes>
      */
     public function listContents(string $path, bool $deep): iterable
     {
-        $path = ltrim($path, '/');
-        $encodedPath = $this->encodePath($path);
+        $directory = self::normalize($path);
 
-        try {
-            $response = $this->client->propFind(
-                $encodedPath,
-                [
-                    '{DAV:}displayname',
-                    '{DAV:}resourcetype',
-                    '{DAV:}getcontentlength',
-                    '{DAV:}getlastmodified',
-                ],
-                1
-            );
-        } catch (Throwable $e) {
-            throw UnableToListContents::atLocation($path, $e->getMessage(), $e);
+        if ($deep && $this->searchDeepListing) {
+            $items = $this->searchListing($directory);
+
+            if ($items !== null) {
+                foreach ($items as $item) {
+                    yield $item;
+                }
+
+                return;
+            }
         }
 
-        foreach ($response as $itemPath => $properties) {
-            $relativePath = urldecode(parse_url($itemPath, PHP_URL_PATH));
-
-
-            if (str_starts_with($relativePath, $this->baseUri)) {
-                $relativePath = substr($relativePath, strlen($this->baseUri));
+        try {
+            /** @var array<string, array<string, mixed>> $response */
+            $response = $this->client->propFind($this->encodePath($directory === '' ? '' : $directory . '/'), self::LISTING_PROPERTIES, 1);
+        } catch (ClientHttpException $exception) {
+            // Like the local adapter: listing a directory that does not exist yields nothing.
+            if ($exception->getHttpStatus() === 404) {
+                return;
             }
 
-            $relativePath = ltrim($relativePath, '/');
+            throw UnableToListContents::atLocation($path, $deep, $exception);
+        } catch (Throwable $exception) {
+            throw UnableToListContents::atLocation($path, $deep, $exception);
+        }
 
-            if (rtrim($relativePath, '/') === rtrim($path, '/')) {
+        foreach ($response as $href => $properties) {
+            $itemPath = $this->pathFromHref((string) $href);
+
+            // The first entry of a Depth: 1 PROPFIND is the directory itself.
+            if ($itemPath === null || $itemPath === $directory) {
                 continue;
             }
 
-            $isDirectory = isset($properties['{DAV:}resourcetype']) &&
-                $properties['{DAV:}resourcetype'] instanceof ResourceType &&
-                in_array('{DAV:}collection', $properties['{DAV:}resourcetype']->getValue(), true);
+            yield $this->attributesFor($itemPath, $properties);
 
-            if ($isDirectory) {
-                yield new DirectoryAttributes(
-                    $relativePath,
-                    null,
-                    isset($properties['{DAV:}getlastmodified']) ? strtotime($properties['{DAV:}getlastmodified']) : null
-                );
-
-                if ($deep) {
-                    foreach ($this->listContents($relativePath, true) as $child) {
-                        yield $child;
-                    }
+            if ($deep && self::isDirectory($properties)) {
+                // Not "yield from": that would reuse the child generator's keys and
+                // make iterator_to_array() overwrite entries.
+                foreach ($this->listContents($itemPath, true) as $child) {
+                    yield $child;
                 }
-            } else {
-                yield new FileAttributes(
-                    $relativePath,
-                    isset($properties['{DAV:}getcontentlength']) ? (int)$properties['{DAV:}getcontentlength'] : null,
-                    null,
-                    isset($properties['{DAV:}getlastmodified']) ? strtotime($properties['{DAV:}getlastmodified']) : null
-                );
             }
         }
     }
 
+    public function move(string $source, string $destination, Config $config): void
+    {
+        if (self::normalize($source) === self::normalize($destination)) {
+            return;
+        }
+
+        try {
+            if (!$this->fileExists($source)) {
+                throw UnableToMoveFile::because('Source file does not exist.', $source, $destination);
+            }
+
+            $this->ensureParentDirectoryExists($destination);
+            $response = $this->request('MOVE', $source, null, [
+                'Destination' => $this->client->getAbsoluteUrl($this->encodePath($destination)),
+                'Overwrite' => 'T',
+            ]);
+        } catch (UnableToMoveFile $exception) {
+            throw $exception;
+        } catch (Throwable $exception) {
+            throw UnableToMoveFile::fromLocationTo($source, $destination, $exception);
+        }
+
+        if (!self::isSuccessful($response['statusCode'])) {
+            throw UnableToMoveFile::fromLocationTo($source, $destination, UnexpectedStatusCode::fromResponse('MOVE', $response));
+        }
+
+        $this->transferVisibility($source, $destination, $config, move: true);
+    }
+
+    public function copy(string $source, string $destination, Config $config): void
+    {
+        if (self::normalize($source) === self::normalize($destination)) {
+            return;
+        }
+
+        try {
+            if (!$this->fileExists($source)) {
+                throw UnableToCopyFile::because('Source file does not exist.', $source, $destination);
+            }
+
+            $this->ensureParentDirectoryExists($destination);
+            $response = $this->request('COPY', $source, null, [
+                'Destination' => $this->client->getAbsoluteUrl($this->encodePath($destination)),
+                'Overwrite' => 'T',
+            ]);
+        } catch (UnableToCopyFile $exception) {
+            throw $exception;
+        } catch (Throwable $exception) {
+            throw UnableToCopyFile::fromLocationTo($source, $destination, $exception);
+        }
+
+        if (!self::isSuccessful($response['statusCode'])) {
+            throw UnableToCopyFile::fromLocationTo($source, $destination, UnexpectedStatusCode::fromResponse('COPY', $response));
+        }
+
+        $this->transferVisibility($source, $destination, $config, move: false);
+    }
+
     /**
-     * Encode a path by rawurlencoding each segment individually.
+     * @param string|resource $contents
+     */
+    private function upload(string $path, $contents, Config $config): void
+    {
+        $spooled = null;
+
+        try {
+            $this->ensureParentDirectoryExists($path);
+            [$body, $size, $checksums, $spooled] = self::prepareUpload($contents);
+
+            $uploadsUrl = $this->layout?->uploadsUrl();
+
+            if ($this->chunkSize !== null && $size > $this->chunkSize && $uploadsUrl !== null) {
+                $this->uploadInChunks($uploadsUrl, $path, $body, $size, $checksums);
+            } else {
+                $response = $this->request('PUT', $path, $body, ['OC-Checksum' => $checksums]);
+                self::expectSuccess('PUT', $response);
+            }
+        } catch (Throwable $exception) {
+            throw UnableToWriteFile::atLocation($path, $exception->getMessage(), $exception);
+        } finally {
+            if (is_resource($spooled)) {
+                fclose($spooled);
+            }
+        }
+
+        $visibility = $config->get(Config::OPTION_VISIBILITY);
+
+        if ($visibility !== Visibility::PUBLIC && $visibility !== Visibility::PRIVATE) {
+            return;
+        }
+
+        if ($this->visibilityMode === VisibilityMode::PublicLinks) {
+            $this->setVisibilityWithShares($path, $visibility);
+        } else {
+            $this->visibilities[self::normalize($path)] = $visibility;
+        }
+    }
+
+    /**
+     * Makes the upload body replayable with a known size and computes the checksums in the same pass.
+     * Seekable streams at offset 0 are used as is; anything else is spooled to php://temp.
      *
-     * This method ensures that each part of the path is safely URL-encoded,
-     * while preserving the directory structure (slashes are not encoded).
+     * @param string|resource $contents
      *
-     * @param string $path The path to encode.
-     * @return string The URL-encoded path.
+     * @return array{0: string|resource, 1: int, 2: string, 3: resource|null}
+     */
+    private static function prepareUpload($contents): array
+    {
+        if (is_string($contents)) {
+            return [$contents, strlen($contents), self::checksumHeader(md5($contents), sha1($contents)), null];
+        }
+
+        $md5 = hash_init('md5');
+        $sha1 = hash_init('sha1');
+        $size = 0;
+        // "seekable" is reported for every user-space stream wrapper, even ones that cannot seek
+        // (e.g. PSR-7 bodies wrapped by Guzzle), so actually try it before relying on it.
+        $useAsIs = stream_get_meta_data($contents)['seekable']
+            && ftell($contents) === 0
+            && fseek($contents, 0) === 0;
+        $spooled = null;
+
+        if (!$useAsIs) {
+            $spooled = fopen('php://temp', 'w+b');
+
+            if ($spooled === false) {
+                throw new RuntimeException('Unable to buffer the provided stream.');
+            }
+        }
+
+        while (!feof($contents)) {
+            $buffer = fread($contents, self::READ_BUFFER);
+
+            if ($buffer === false) {
+                throw new RuntimeException('Unable to read from the provided stream.');
+            }
+
+            if ($buffer === '') {
+                continue;
+            }
+
+            hash_update($md5, $buffer);
+            hash_update($sha1, $buffer);
+            $size += strlen($buffer);
+
+            if ($spooled !== null && fwrite($spooled, $buffer) === false) {
+                throw new RuntimeException('Unable to buffer the provided stream.');
+            }
+        }
+
+        $body = $spooled ?? $contents;
+
+        if (!rewind($body)) {
+            throw new RuntimeException('Unable to rewind the upload stream.');
+        }
+
+        return [$body, $size, self::checksumHeader(hash_final($md5), hash_final($sha1)), $spooled];
+    }
+
+    /**
+     * Nextcloud's chunked upload: MKCOL an upload folder, PUT numbered chunks, MOVE ".file" to the target.
+     * Works with chunking v2 (Redis/Memcached on the server) and the older assembly fallback.
+     *
+     * @param string|resource $body
+     */
+    private function uploadInChunks(string $uploadsUrl, string $path, $body, int $size, string $checksums): void
+    {
+        assert($this->chunkSize !== null);
+
+        $chunkSize = max($this->chunkSize, (int) ceil($size / self::MAX_CHUNKS));
+        $uploadUrl = $uploadsUrl . 'flysystem-' . bin2hex(random_bytes(16));
+        $headers = [
+            'Destination' => $this->client->getAbsoluteUrl($this->encodePath($path)),
+            'OC-Total-Length' => (string) $size,
+        ];
+
+        try {
+            self::expectSuccess('MKCOL', $this->requestUrl('MKCOL', $uploadUrl, null, $headers));
+
+            for ($offset = 0, $number = 1; $offset < $size; ++$number) {
+                $chunk = is_string($body) ? substr($body, $offset, $chunkSize) : stream_get_contents($body, $chunkSize);
+
+                if ($chunk === false || $chunk === '') {
+                    throw new RuntimeException(sprintf('The stream ended after %d of %d bytes.', $offset, $size));
+                }
+
+                self::expectSuccess('PUT', $this->requestUrl('PUT', sprintf('%s/%05d', $uploadUrl, $number), $chunk, $headers));
+                $offset += strlen($chunk);
+            }
+
+            self::expectSuccess('MOVE', $this->requestUrl('MOVE', $uploadUrl . '/.file', null, $headers + [
+                'OC-Checksum' => $checksums,
+                'Overwrite' => 'T',
+            ]));
+        } catch (Throwable $exception) {
+            try {
+                $this->client->request('DELETE', $uploadUrl);
+            } catch (Throwable) {
+                // Best effort: Nextcloud also cleans up stale uploads itself.
+            }
+
+            throw $exception;
+        }
+    }
+
+    /**
+     * Deep listing in one request. Returns null when SEARCH is unavailable or the result may be incomplete.
+     *
+     * @return list<StorageAttributes>|null
+     */
+    private function searchListing(string $directory): ?array
+    {
+        $scope = $this->layout?->searchScope($directory);
+
+        if ($scope === null || $this->layout === null) {
+            return null;
+        }
+
+        $select = '';
+
+        foreach (self::LISTING_PROPERTIES as $property) {
+            [$namespace, $name] = explode('}', ltrim($property, '{'), 2);
+            $select .= sprintf('<%s xmlns="%s"/>', $name, $namespace);
+        }
+
+        $body = '<?xml version="1.0" encoding="UTF-8"?>'
+            . '<d:searchrequest xmlns:d="DAV:"><d:basicsearch>'
+            . '<d:select><d:prop>' . $select . '</d:prop></d:select>'
+            . '<d:from><d:scope><d:href>' . htmlspecialchars($scope, ENT_XML1) . '</d:href><d:depth>infinity</d:depth></d:scope></d:from>'
+            . '<d:where><d:like><d:prop><d:displayname/></d:prop><d:literal>%</d:literal></d:like></d:where>'
+            . '<d:orderby/>'
+            . '<d:limit><d:nresults>' . self::SEARCH_LIMIT . '</d:nresults></d:limit>'
+            . '</d:basicsearch></d:searchrequest>';
+
+        try {
+            $response = $this->requestUrl('SEARCH', $this->layout->davUrl(), $body, ['Content-Type' => 'text/xml; charset=utf-8']);
+
+            if ($response['statusCode'] !== 207) {
+                return null;
+            }
+
+            /** @var array<string, array<int, array<string, mixed>>> $result */
+            $result = $this->client->parseMultiStatus($response['body']);
+        } catch (Throwable) {
+            return null;
+        }
+
+        if (count($result) >= self::SEARCH_LIMIT) {
+            return null;
+        }
+
+        $prefix = $directory === '' ? '' : $directory . '/';
+        $items = [];
+
+        foreach ($result as $href => $statuses) {
+            $itemPath = $this->pathFromHref((string) $href);
+
+            if ($itemPath === null || $itemPath === '' || $itemPath === $directory || !str_starts_with($itemPath, $prefix)) {
+                continue;
+            }
+
+            $items[$itemPath] = $this->attributesFor($itemPath, $statuses[200] ?? []);
+        }
+
+        // Parents before children, like a PROPFIND walk.
+        ksort($items, SORT_STRING);
+
+        return array_values($items);
+    }
+
+    /**
+     * @param array<string, mixed> $properties
+     */
+    private function attributesFor(string $path, array $properties): StorageAttributes
+    {
+        if (self::isDirectory($properties)) {
+            return new DirectoryAttributes($path, lastModified: self::lastModifiedFrom($properties));
+        }
+
+        return new FileAttributes(
+            $path,
+            fileSize: self::fileSizeFrom($properties),
+            visibility: $this->visibilityMode === VisibilityMode::InMemory ? ($this->visibilities[$path] ?? null) : null,
+            lastModified: self::lastModifiedFrom($properties),
+            mimeType: self::mimeTypeFrom($properties),
+        );
+    }
+
+    private function setVisibilityWithShares(string $path, string $visibility): void
+    {
+        try {
+            $api = $this->shareApi();
+            $shares = $api->linkShares($path);
+
+            if ($shares === null) {
+                throw UnableToSetVisibility::atLocation($path, 'File does not exist.');
+            }
+
+            if ($visibility === Visibility::PUBLIC && $shares === []) {
+                $api->createLinkShare($path);
+            }
+
+            if ($visibility === Visibility::PRIVATE) {
+                foreach ($shares as $share) {
+                    $api->deleteShare($share['id']);
+                }
+            }
+        } catch (UnableToSetVisibility $exception) {
+            throw $exception;
+        } catch (Throwable $exception) {
+            throw UnableToSetVisibility::atLocation($path, $exception->getMessage(), $exception);
+        }
+    }
+
+    private function shareApi(): ShareApi
+    {
+        if ($this->layout === null) {
+            throw new RuntimeException('Cannot derive the Nextcloud server URL from the base URI; expected ".../remote.php/dav/files/{userId}/".');
+        }
+
+        return $this->shareApi ??= new ShareApi($this->client, $this->layout);
+    }
+
+    /**
+     * @param string|resource|null $body
+     * @param array<string, string> $headers
+     *
+     * @return array{body: string, statusCode: int, headers: array<string, mixed>}
+     */
+    private function request(string $method, string $path, $body = null, array $headers = []): array
+    {
+        /** @var array{body: string, statusCode: int, headers: array<string, mixed>} */
+        return $this->client->request($method, $this->encodePath($path), $body, $headers);
+    }
+
+    /**
+     * Request to an absolute URL (upload folders, SEARCH endpoint).
+     *
+     * @param string|resource|null $body
+     * @param array<string, string> $headers
+     *
+     * @return array{body: string, statusCode: int, headers: array<string, mixed>}
+     */
+    private function requestUrl(string $method, string $url, $body = null, array $headers = []): array
+    {
+        /** @var array{body: string, statusCode: int, headers: array<string, mixed>} */
+        return $this->client->request($method, $url, $body, $headers);
+    }
+
+    /**
+     * @param array{body: string, statusCode: int, headers: array<string, mixed>} $response
+     */
+    private static function expectSuccess(string $method, array $response): void
+    {
+        if (!self::isSuccessful($response['statusCode'])) {
+            throw UnexpectedStatusCode::fromResponse($method, $response);
+        }
+    }
+
+    /**
+     * Depth 0 PROPFIND. Returns null when the resource does not exist.
+     *
+     * @param list<string> $properties
+     *
+     * @return array<string, mixed>|null
+     */
+    private function propFind(string $path, array $properties): ?array
+    {
+        try {
+            /** @var array<string, mixed> */
+            return $this->client->propFind($this->encodePath($path), $properties);
+        } catch (ClientHttpException $exception) {
+            if ($exception->getHttpStatus() === 404) {
+                return null;
+            }
+
+            throw $exception;
+        }
+    }
+
+    /**
+     * PROPFIND for a metadata call: fails when the path is missing or a directory.
+     *
+     * @param list<string> $properties
+     * @param callable(string, string, ?Throwable): UnableToRetrieveMetadata $fail
+     *
+     * @return array<string, mixed>
+     */
+    private function fileProperties(string $path, array $properties, callable $fail): array
+    {
+        try {
+            $result = $this->propFind($path, [...$properties, self::PROP_RESOURCE_TYPE]);
+        } catch (Throwable $exception) {
+            throw $fail($path, $exception->getMessage(), $exception);
+        }
+
+        if ($result === null) {
+            throw $fail($path, 'File does not exist.', null);
+        }
+
+        if (self::isDirectory($result)) {
+            throw $fail($path, 'Path is a directory.', null);
+        }
+
+        return $result;
+    }
+
+    private function ensureParentDirectoryExists(string $path): void
+    {
+        $parent = dirname(self::normalize($path));
+
+        if ($parent === '.' || $parent === '' || $parent === '/') {
+            return;
+        }
+
+        if (!$this->directoryExists($parent)) {
+            $this->createDirectory($parent, new Config());
+        }
+    }
+
+    private function transferVisibility(string $source, string $destination, Config $config, bool $move): void
+    {
+        $source = self::normalize($source);
+        $destination = self::normalize($destination);
+        $explicit = $config->get(Config::OPTION_VISIBILITY);
+
+        if ($this->visibilityMode === VisibilityMode::PublicLinks) {
+            // Shares belong to the file, so they follow a MOVE on their own. A COPY is a new file.
+            $visibility = $explicit;
+
+            if ($visibility === null && !$move && $config->get(Config::OPTION_RETAIN_VISIBILITY, true)) {
+                $visibility = $this->visibility($source)->visibility();
+            }
+
+            if ($visibility === Visibility::PUBLIC || $visibility === Visibility::PRIVATE) {
+                $this->setVisibilityWithShares($destination, $visibility);
+            }
+
+            return;
+        }
+
+        $visibility = $explicit ?? $this->visibilities[$source] ?? null;
+
+        if ($move) {
+            unset($this->visibilities[$source]);
+        }
+
+        if (is_string($visibility)) {
+            $this->visibilities[$destination] = $visibility;
+        } else {
+            unset($this->visibilities[$destination]);
+        }
+    }
+
+    /**
+     * Turns an href from a PROPFIND/SEARCH response into a path relative to the base URI.
+     */
+    private function pathFromHref(string $href): ?string
+    {
+        $path = parse_url($href, PHP_URL_PATH);
+
+        if (!is_string($path)) {
+            return null;
+        }
+
+        $path = rawurldecode($path);
+
+        if (str_starts_with($path, $this->basePath)) {
+            $path = substr($path, strlen($this->basePath));
+        } elseif (rtrim($path, '/') . '/' === $this->basePath) {
+            $path = '';
+        } else {
+            return null;
+        }
+
+        return self::normalize($path);
+    }
+
+    /**
+     * Encodes every path segment, keeping the slashes.
      */
     private function encodePath(string $path): string
     {
-        $path = ltrim($path, '/');
+        $trailingSlash = str_ends_with($path, '/');
+        $path = self::normalize($path);
 
         if ($path === '') {
             return '';
         }
 
-        $segments = explode('/', $path);
-        $encodedSegments = array_map('rawurlencode', $segments);
+        return implode('/', array_map(rawurlencode(...), explode('/', $path))) . ($trailingSlash ? '/' : '');
+    }
 
-        return implode('/', $encodedSegments);
+    private static function normalize(string $path): string
+    {
+        return trim($path, '/');
+    }
+
+    private static function isSuccessful(int $statusCode): bool
+    {
+        return $statusCode >= 200 && $statusCode < 300;
+    }
+
+    private static function checksumHeader(string $md5, string $sha1): string
+    {
+        return 'MD5:' . $md5 . ' SHA1:' . $sha1;
     }
 
     /**
-     * Move a file or directory to a new location.
+     * @param array<string, mixed> $properties
      *
-     * @param string $source The source path.
-     * @param string $destination The destination path.
-     * @param Config $config Additional configuration options (currently unused).
-     *
-     * @throws UnableToMoveFile If the source file does not exist or the move operation fails.
-     * @throws Throwable If an unexpected error occurs during the move.
+     * @return array<string, string> lower-case algorithm => lower-case hex digest
      */
-    public function move(string $source, string $destination, Config $config): void
+    private static function checksumsFrom(array $properties): array
     {
-        $encodedSource = $this->encodePath($source);
-        $encodedDestination = $this->encodePath($destination);
+        $raw = $properties[self::PROP_CHECKSUMS] ?? null;
+        $values = [];
 
-        try {
-            if (!$this->fileExists($source)) {
-                throw UnableToMoveFile::fromLocationTo($source, $destination);
+        if (is_string($raw)) {
+            $values = preg_split('/\s+/', trim($raw)) ?: [];
+        } elseif (is_array($raw)) {
+            foreach ($raw as $element) {
+                $value = is_array($element) ? ($element['value'] ?? null) : $element;
+
+                if (is_string($value)) {
+                    array_push($values, ...(preg_split('/\s+/', trim($value)) ?: []));
+                }
             }
-        } catch (ClientHttpException $e) {
-            if ($e->getHttpStatus() === 404) {
-                throw UnableToMoveFile::fromLocationTo($source, $destination, $e);
+        }
+
+        $checksums = [];
+
+        foreach ($values as $value) {
+            if (preg_match('/^([A-Za-z0-9]+):([0-9A-Fa-f]+)$/', $value, $m) === 1) {
+                $checksums[strtolower($m[1])] = strtolower($m[2]);
             }
-            throw $e; // Re-throw unexpected HTTP errors
-        } catch (Throwable $e) {
-            throw UnableToMoveFile::fromLocationTo($source, $destination, $e);
         }
 
-        try {
-            $this->client->request(
-                'MOVE',
-                $encodedSource,
-                null,
-                [
-                    'Destination' => $this->client->getAbsoluteUrl($encodedDestination),
-                    'Overwrite' => 'T',
-                ]
-            );
-        } catch (Throwable $e) {
-            throw UnableToMoveFile::fromLocationTo($source, $destination, $e);
-        }
-    }
-
-
-    /**
-     * Copy a file or directory to a new location.
-     *
-     * @param string $source The source path.
-     * @param string $destination The destination path.
-     * @param Config $config Additional configuration options (currently unused).
-     *
-     * @throws UnableToCopyFile If the source file does not exist or the copy operation fails.
-     * @throws Throwable If an unexpected error occurs during the copy.
-     */
-    public function copy(string $source, string $destination, Config $config): void
-    {
-        $encodedSource = $this->encodePath($source);
-        $encodedDestination = $this->encodePath($destination);
-
-        try {
-            if (!$this->fileExists($source)) {
-                throw UnableToCopyFile::fromLocationTo($source, $destination);
-            }
-        } catch (ClientHttpException $e) {
-            if ($e->getHttpStatus() === 404) {
-                throw UnableToCopyFile::fromLocationTo($source, $destination, $e);
-            }
-            throw $e; // Re-throw unexpected HTTP errors
-        } catch (Throwable $e) {
-            throw UnableToCopyFile::fromLocationTo($source, $destination, $e);
-        }
-
-        // Propagate visibility if cached
-        if (isset($this->visibilities[$source])) {
-            $this->visibilities[$destination] = $this->visibilities[$source];
-        }
-
-        try {
-            $this->client->request(
-                'COPY',
-                $encodedSource,
-                null,
-                [
-                    'Destination' => $this->client->getAbsoluteUrl($encodedDestination),
-                    'Overwrite' => 'T',
-                ]
-            );
-        } catch (Throwable $e) {
-            throw UnableToCopyFile::fromLocationTo($source, $destination, $e);
-        }
+        return $checksums;
     }
 
     /**
-     * Ensures that the parent directory of the given path exists.
-     *
-     * If the path is directly under the root (e.g., "file.txt"), no action is taken.
-     * Otherwise, if the parent directory does not exist, it will be created.
-     *
-     * @param string $path The file or directory path whose parent directory must exist.
-     *
-     * @throws FilesystemException If directory creation fails.
-     * @throws Throwable If any unexpected error occurs.
+     * @param array<string, mixed> $properties
      */
-    private function ensureParentDirectoryExists(string $path): void
+    private static function isDirectory(array $properties): bool
     {
-        $dirname = dirname($path);
+        $resourceType = $properties[self::PROP_RESOURCE_TYPE] ?? null;
 
-        // If we're writing directly in root (e.g., "file.txt"), no parent to create
-        if ($dirname === '.' || $dirname === '') {
-            return;
-        }
-
-        if (!$this->directoryExists($dirname)) {
-            $this->createDirectory($dirname, new Config());
-        }
+        return $resourceType instanceof ResourceType && $resourceType->is('{DAV:}collection');
     }
 
     /**
-     * Stores the visibility setting for a given path.
-     *
-     * Only "public" and "private" visibilities are stored explicitly.
-     * If no visibility is configured, the file remains with default (private) visibility.
-     *
-     * @param Config $config Configuration object possibly containing visibility settings.
-     * @param string $path The path to associate with the visibility setting.
+     * @param array<string, mixed> $properties
      */
-    private function storeVisibility(Config $config, string $path): void
-
+    private static function fileSizeFrom(array $properties): ?int
     {
-        if ($config->get('visibility') === 'public') {
-            $this->visibilities[$path] = Visibility::PUBLIC;
-        } elseif ($config->get('visibility') === 'private') {
-            $this->visibilities[$path] = Visibility::PRIVATE;
+        $size = $properties[self::PROP_CONTENT_LENGTH] ?? null;
+
+        return is_numeric($size) ? (int) $size : null;
+    }
+
+    /**
+     * @param array<string, mixed> $properties
+     */
+    private static function lastModifiedFrom(array $properties): ?int
+    {
+        $date = $properties[self::PROP_LAST_MODIFIED] ?? null;
+
+        if (!is_string($date)) {
+            return null;
         }
 
+        $timestamp = strtotime($date);
 
+        return $timestamp === false ? null : $timestamp;
+    }
+
+    /**
+     * @param array<string, mixed> $properties
+     */
+    private static function mimeTypeFrom(array $properties): ?string
+    {
+        $mimeType = $properties[self::PROP_CONTENT_TYPE] ?? null;
+
+        if (!is_string($mimeType)) {
+            return null;
+        }
+
+        // Strip parameters such as "; charset=utf-8".
+        $mimeType = trim(explode(';', $mimeType, 2)[0]);
+
+        return $mimeType === '' || $mimeType === self::UNKNOWN_MIME_TYPE ? null : $mimeType;
+    }
+
+    /**
+     * @param array<string, mixed> $settings
+     *
+     * @return array<string, mixed>
+     */
+    private static function normalizeSettings(array $settings): array
+    {
+        if (!isset($settings['baseUri']) || !is_string($settings['baseUri']) || trim($settings['baseUri']) === '') {
+            throw new InvalidArgumentException('The "baseUri" setting is required, e.g. "https://cloud.example.com/remote.php/dav/files/{userId}/".');
+        }
+
+        // Without a trailing slash, relative paths resolve against the *parent* directory
+        // ("…/files/admin" + "a.txt" => "…/files/a.txt").
+        $settings['baseUri'] = rtrim($settings['baseUri'], '/') . '/';
+
+        // Nextcloud supports Basic auth (ideally with an app password). Sending it
+        // preemptively avoids the 401 challenge round-trip cURL makes when it has to
+        // negotiate between Basic and Digest, which halves the number of requests.
+        if (isset($settings['userName']) && !isset($settings['authType'])) {
+            $settings['authType'] = Client::AUTH_BASIC;
+        }
+
+        return $settings;
     }
 }

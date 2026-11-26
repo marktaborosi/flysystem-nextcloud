@@ -1,26 +1,20 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Marktaborosi\FlysystemNextcloud\Tests\Integration;
 
-use League\Flysystem\AdapterTestUtilities\FilesystemAdapterTestCase;
 use League\Flysystem\Config;
+use League\Flysystem\FileAttributes;
 use League\Flysystem\FilesystemException;
-use Marktaborosi\FlysystemNextcloud\NextCloudAdapter;
-use League\Flysystem\FilesystemAdapter;
+use League\Flysystem\UnableToCopyFile;
 use Throwable;
 
-class NextCloudAdapterTest extends FilesystemAdapterTestCase
+/**
+ * The official Flysystem adapter test suite (plus a few extra cases) with the default configuration.
+ */
+final class NextCloudAdapterTest extends NextcloudTestCase
 {
-    protected static function createFilesystemAdapter(): FilesystemAdapter
-    {
-        return new NextCloudAdapter([
-            'baseUri' => 'http://localhost:8080/remote.php/dav/files/admin/',
-            'userName' => 'admin',
-            'password' => 'admin',
-        ]);
-
-    }
-
     /**
      * @throws Throwable
      * @throws FilesystemException
@@ -35,7 +29,7 @@ class NextCloudAdapterTest extends FilesystemAdapterTestCase
         $this->runScenario(function () {
             $attributes = $this->adapter()->mimeType('testfile.json');
 
-            $this->assertInstanceOf(\League\Flysystem\FileAttributes::class, $attributes);
+            $this->assertInstanceOf(FileAttributes::class, $attributes);
             $this->assertEquals('testfile.json', $attributes->path());
             $this->assertEquals('application/json', $attributes->mimeType());
         });
@@ -55,7 +49,7 @@ class NextCloudAdapterTest extends FilesystemAdapterTestCase
         $this->runScenario(function () {
             $attributes = $this->adapter()->mimeType('image.png');
 
-            $this->assertInstanceOf(\League\Flysystem\FileAttributes::class, $attributes);
+            $this->assertInstanceOf(FileAttributes::class, $attributes);
             $this->assertEquals('image.png', $attributes->path());
             $this->assertEquals('image/png', $attributes->mimeType());
         });
@@ -74,7 +68,7 @@ class NextCloudAdapterTest extends FilesystemAdapterTestCase
 
             $items = iterator_to_array($this->adapter()->listContents('dir1', true));
 
-            $paths = array_map(fn($item) => $item->path(), $items);
+            $paths = array_map(fn ($item) => $item->path(), $items);
 
             $this->assertContains('dir1/file1.txt', $paths);
             $this->assertContains('dir1/dir2/file2.txt', $paths);
@@ -139,7 +133,7 @@ class NextCloudAdapterTest extends FilesystemAdapterTestCase
      */
     public function test_copying_nonexistent_file_throws_exception(): void
     {
-        $this->expectException(\League\Flysystem\UnableToCopyFile::class);
+        $this->expectException(UnableToCopyFile::class);
 
         $this->runScenario(function () {
             $this->adapter()->copy('nonexistent.txt', 'copy.txt', new Config());

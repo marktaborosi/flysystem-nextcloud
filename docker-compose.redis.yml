@@ -1,0 +1,12 @@
+# Optional: adds Redis, which enables Nextcloud's faster chunked upload (v2) and file locking.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.redis.yml up -d --wait
+services:
+  nextcloud:
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:alpine
