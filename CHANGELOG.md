@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-26
+
+### Fixed
+
+- `sabre/xml` is now required at `^2.2`. Versions before 2.1.2 cannot parse compact (unindented) WebDAV responses,
+  which broke listings and existence checks for installs that resolved an old `sabre/xml` (e.g. `--prefer-lowest`).
+- The quota integration test accounts for the sample files Nextcloud copies into new accounts, so it also passes on the
+  official Docker image.
+- Static analysis passes with the latest PHPStan release.
+
 ## [1.1.0] - 2026-11-26
 
 ### Fixed
@@ -99,6 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full test coverage using `league/flysystem-adapter-test-utilities`.
 - Additional integration tests for MIME type detection.
 
-[Unreleased]: https://github.com/marktaborosi/flysystem-nextcloud/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/marktaborosi/flysystem-nextcloud/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/marktaborosi/flysystem-nextcloud/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/marktaborosi/flysystem-nextcloud/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/marktaborosi/flysystem-nextcloud/releases/tag/v1.0.0

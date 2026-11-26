@@ -30,7 +30,8 @@
         "php": "^8.2",
         "ext-curl": "*",
         "league/flysystem": "^3.29",
-        "sabre/dav": "^4.7"
+        "sabre/dav": "^4.7",
+        "sabre/xml": "^2.2"
     },
     "require-dev": {
         "friendsofphp/php-cs-fixer": "^3.64",

@@ -371,10 +371,16 @@ final class NextcloudScenariosTest extends TestCase
     #[Test]
     public function exceeding_the_quota_is_reported_with_status_507(): void
     {
-        $user = $this->createUser(quota: '1 MB');
+        $user = $this->createUser();
 
         try {
             $adapter = NextCloudAdapter::fromCredentials(self::serverUrl(), $user['id'], $user['password'], chunkSize: 512 * 1024);
+
+            // The first login copies Nextcloud's skeleton files (several MB on the official image),
+            // which count towards the quota: leave exactly 1 MiB free on top of them.
+            $adapter->directoryExists('');
+            $this->setQuota($user['id'], $this->usedSpace($user['id']) + self::MiB);
+
             $adapter->write('fits.txt', 'small', new Config());
 
             foreach (['single PUT' => null, 'chunked' => 512 * 1024] as $label => $chunkSize) {
@@ -487,12 +493,35 @@ final class NextcloudScenariosTest extends TestCase
         return ['id' => $id, 'password' => $password];
     }
 
+    private function usedSpace(string $id): int
+    {
+        [$status, $body] = $this->ocs('GET', '/ocs/v2.php/cloud/users/' . rawurlencode($id));
+        $used = json_decode($body, true);
+
+        foreach (['ocs', 'data', 'quota', 'used'] as $key) {
+            $used = is_array($used) ? ($used[$key] ?? null) : null;
+        }
+
+        self::assertSame(200, $status, $body);
+        self::assertIsNumeric($used, $body);
+
+        return (int) $used;
+    }
+
+    private function setQuota(string $id, int $bytes): void
+    {
+        [$status, $body] = $this->ocs('PUT', '/ocs/v2.php/cloud/users/' . rawurlencode($id), ['key' => 'quota', 'value' => (string) $bytes]);
+
+        self::assertSame(200, $status, $body);
+    }
+
     private function deleteUser(string $id): void
     {
         $this->ocs('DELETE', '/ocs/v2.php/cloud/users/' . rawurlencode($id));
     }
 
     /**
+     * @param non-empty-string $method
      * @param array<string, string> $fields
      *
      * @return array{0: int, 1: string}

@@ -735,9 +735,10 @@ class NextCloudAdapter implements FilesystemAdapter, PublicUrlGenerator, Checksu
      */
     private function searchListing(string $directory): ?array
     {
-        $scope = $this->layout?->searchScope($directory);
+        $layout = $this->layout;
+        $scope = $layout?->searchScope($directory);
 
-        if ($scope === null || $this->layout === null) {
+        if ($layout === null || $scope === null) {
             return null;
         }
 
@@ -758,7 +759,7 @@ class NextCloudAdapter implements FilesystemAdapter, PublicUrlGenerator, Checksu
             . '</d:basicsearch></d:searchrequest>';
 
         try {
-            $response = $this->requestUrl('SEARCH', $this->layout->davUrl(), $body, ['Content-Type' => 'text/xml; charset=utf-8']);
+            $response = $this->requestUrl('SEARCH', $layout->davUrl(), $body, ['Content-Type' => 'text/xml; charset=utf-8']);
 
             if ($response['statusCode'] !== 207) {
                 return null;
